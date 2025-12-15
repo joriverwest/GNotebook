@@ -1,144 +1,186 @@
 import streamlit as st
+import datetime
 from google.oauth2 import service_account
 from googleapiclient.discovery import build
 from googleapiclient.http import MediaIoBaseUpload
 import io
-import time
 
-# --- 認証機能（ここを追加しました） ---
-def check_password():
-    """パスワードが合っているか確認する関数"""
-    
-    # すでに認証済みならTrueを返す
-    if st.session_state.get("password_correct", False):
-        return True
+# ページ設定（ブラウザのタブ名など）
+st.set_page_config(page_title="Cloud Notebook", layout="wide", page_icon="📝")
 
-    # パスワード入力フォームを表示
-    st.set_page_config(page_title="Login Required")
-    st.header("🔒 ログインが必要です")
-    password_input = st.text_input("パスワードを入力してください", type="password")
-
-    if st.button("ログイン"):
-        # Secretsに設定したパスワードと照合
-        if password_input == st.secrets["app_password"]:
-            st.session_state["password_correct"] = True
-            st.success("ログイン成功！")
-            time.sleep(1) # 少し待ってからリロード
-            st.rerun()
-        else:
-            st.error("パスワードが違います")
-            
-    return False
-
-# --- 以下、前回のGoogle Drive操作ロジック ---
-
+# --- 1. Google Drive 認証設定 ---
+# Streamlit Cloudの "Secrets" 機能から認証情報を読み込みます
+@st.cache_resource
 def get_drive_service():
-    try:
-        creds_dict = dict(st.secrets["gcp_service_account"])
-        creds = service_account.Credentials.from_service_account_info(
-            creds_dict,
-            scopes=['https://www.googleapis.com/auth/drive']
-        )
-        return build('drive', 'v3', credentials=creds)
-    except Exception as e:
-        st.error(f"認証エラー: Secrets設定を確認してください。 {e}")
+    # st.secrets["gcp_service_account"] にJSONの中身が辞書として入っている前提
+    if "gcp_service_account" not in st.secrets:
+        st.error("Secretsに 'gcp_service_account' が設定されていません。")
         return None
 
-def list_files(service):
+    # 辞書データから認証情報を作成
+    creds = service_account.Credentials.from_service_account_info(
+        st.secrets["gcp_service_account"],
+        scopes=['https://www.googleapis.com/auth/drive']
+    )
+    return build('drive', 'v3', credentials=creds)
+
+# フォルダIDもSecretsから取得
+FOLDER_ID = st.secrets["drive_folder_id"]
+
+# --- 2. ファイル操作関数 ---
+
+def get_files():
+    """指定フォルダ内のテキストファイル一覧を取得"""
+    service = get_drive_service()
+    if not service: return []
+    
+    query = f"'{FOLDER_ID}' in parents and trashed = false"
     results = service.files().list(
-        q="mimeType = 'text/plain' and trashed = false",
-        pageSize=20,
-        fields="nextPageToken, files(id, name)"
+        q=query,
+        pageSize=50,
+        fields="files(id, name, modifiedTime)",
+        orderBy="name desc"
     ).execute()
     return results.get('files', [])
 
-def create_file(service, name, content):
-    file_metadata = {'name': name, 'mimeType': 'text/plain'}
-    media = MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='text/plain')
-    file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-    return file.get('id')
+def read_file(file_id):
+    """ファイルの中身を読み込む"""
+    service = get_drive_service()
+    content = service.files().get_media(fileId=file_id).execute()
+    return content.decode('utf-8')
 
-def update_file(service, file_id, content):
-    media = MediaIoBaseUpload(io.BytesIO(content.encode('utf-8')), mimetype='text/plain')
-    service.files().update(fileId=file_id, media_body=media).execute()
+def save_file(file_id, name, text):
+    """新規保存(file_id=None) または 上書き保存"""
+    service = get_drive_service()
+    
+    # テキストをアップロード可能な形式に変換
+    fh = io.BytesIO(text.encode('utf-8'))
+    media = MediaIoBaseUpload(fh, mimetype='text/plain', resumable=False)
+    
+    if file_id:
+        # 上書き保存 (Update)
+        service.files().update(
+            fileId=file_id,
+            media_body=media
+        ).execute()
+        return file_id, name
+    else:
+        # 新規保存 (Create)
+        file_metadata = {
+            'name': name,
+            'parents': [FOLDER_ID],
+            'mimeType': 'text/plain'
+        }
+        file = service.files().create(
+            body=file_metadata,
+            media_body=media,
+            fields='id'
+        ).execute()
+        return file.get('id'), name
 
-def delete_file(service, file_id):
+def delete_file(file_id):
+    """ファイルをゴミ箱へ"""
+    service = get_drive_service()
     service.files().delete(fileId=file_id).execute()
 
-# --- メイン画面 ---
-def main_app():
-    # ページ設定を再適用（ログイン画面で設定済みだが上書き用）
-    # st.set_page_configは一度しか呼べないため、check_password内で呼んでいればエラーになる可能性があります。
-    # そのため、page_titleの変更などはここでは行わず、レイアウトのみ記述します。
-    
-    st.title("☁️ Google Drive Text Editor")
-    
-    # ログアウトボタン
-    if st.sidebar.button("ログアウト"):
-        st.session_state["password_correct"] = False
-        st.rerun()
+# --- 3. UI構築 ---
 
-    service = get_drive_service()
-    if not service:
-        st.stop()
+st.title("📝 Cloud Notebook")
 
-    st.sidebar.header("Files")
+# サイドバー：ファイル操作と一覧
+with st.sidebar:
+    st.header("Files")
     
-    if st.sidebar.button("＋ 新規ファイル作成"):
+    # 「新規作成」ボタン
+    if st.button("＋ 新規作成", use_container_width=True):
         st.session_state.current_file_id = None
-        st.session_state.current_file_name = ""
-        st.session_state.file_content = ""
+        st.session_state.editor_content = ""
         st.rerun()
 
-    files = list_files(service)
+    st.divider()
+
+    # ファイル一覧取得
+    files = get_files()
     
-    for f in files:
-        if st.sidebar.button(f"📄 {f['name']}", key=f['id']):
-            st.session_state.current_file_id = f['id']
-            st.session_state.current_file_name = f['name']
-            try:
-                content = service.files().get_media(fileId=f['id']).execute().decode('utf-8')
-                st.session_state.file_content = content
-            except Exception:
-                st.session_state.file_content = "（読み込み不可）"
+    # ラジオボタンやセレクトボックスでファイルを選択
+    # (名前と更新日時を表示用に整形)
+    file_options = {f['name']: f['id'] for f in files}
+    
+    # 選択中のファイルがあれば、それをデフォルトにする
+    current_index = 0
+    if "current_file_id" in st.session_state and st.session_state.current_file_id:
+        # IDから名前を探す
+        for i, f in enumerate(files):
+            if f['id'] == st.session_state.current_file_id:
+                current_index = i
+                break
+    
+    # 選択ボックス（スマホでも使いやすい）
+    selected_name = st.selectbox(
+        "保存済みファイル",
+        options=list(file_options.keys()) if files else [],
+        index=current_index if files else None,
+        key="file_selector"
+    )
+
+    # 選択が変わったら中身をロードするロジック
+    if selected_name:
+        selected_id = file_options[selected_name]
+        # まだロードしていない、または別のファイルを選んだ場合
+        if "current_file_id" not in st.session_state or st.session_state.current_file_id != selected_id:
+            st.session_state.current_file_id = selected_id
+            st.session_state.editor_content = read_file(selected_id)
             st.rerun()
 
-    if 'current_file_id' not in st.session_state:
-        st.info("サイドバーからファイルを選択するか、新規作成してください。")
-    else:
-        is_new = st.session_state.current_file_id is None
-        mode_text = "新規作成" if is_new else "編集"
-        
-        st.subheader(f"{mode_text}: {st.session_state.current_file_name or '名称未設定'}")
+# メインエリア
+file_id = st.session_state.get("current_file_id", None)
+content = st.session_state.get("editor_content", "")
 
-        new_name = st.text_input("ファイル名 (.txt)", value=st.session_state.current_file_name)
-        if new_name and not new_name.endswith(".txt"):
-            new_name += ".txt"
+# 新規作成用のファイル名自動生成
+if file_id is None:
+    now = datetime.datetime.now()
+    default_filename = now.strftime("%Y%m%d_%H%M%S.txt")
+    st.subheader("新規作成モード")
+else:
+    default_filename = [k for k, v in file_options.items() if v == file_id][0]
+    st.subheader(f"編集: {default_filename}")
 
-        new_content = st.text_area("内容", value=st.session_state.get('file_content', ""), height=400)
+# エディタエリア
+# key="editor_text" を指定して入力を受け取る
+input_text = st.text_area("内容", value=content, height=400)
 
-        col1, col2 = st.columns([1, 5])
-        
-        with col1:
-            if st.button("保存する", type="primary"):
-                if is_new:
-                    create_file(service, new_name, new_content)
-                    st.success(f"{new_name} を作成しました！")
-                else:
-                    update_file(service, st.session_state.current_file_id, new_content)
-                    st.success("更新しました！")
-                st.rerun()
+col1, col2 = st.columns([1, 4])
 
-        with col2:
-            if not is_new:
-                if st.button("削除する", type="secondary"):
-                    delete_file(service, st.session_state.current_file_id)
-                    st.warning("削除しました。")
-                    del st.session_state.current_file_id
+with col1:
+    if st.button("保存する", type="primary", use_container_width=True):
+        if not input_text:
+            st.warning("空のファイルは保存できません。")
+        else:
+            with st.spinner("Google Driveに保存中..."):
+                try:
+                    # 新規ならファイル名を決定、既存ならそのまま
+                    fname = default_filename
+                    new_id, new_name = save_file(file_id, fname, input_text)
+                    
+                    st.success(f"保存しました: {new_name}")
+                    # 状態を更新してリロード
+                    st.session_state.current_file_id = new_id
+                    st.session_state.editor_content = input_text
                     st.rerun()
+                except Exception as e:
+                    st.error(f"保存エラー: {e}")
 
-# --- 実行のエントリーポイント ---
-if __name__ == "__main__":
-    # パスワードチェックが通った場合のみ、メインアプリを表示
-    if check_password():
-        main_app()
+with col2:
+    if file_id is not None:
+        if st.button("このファイルを削除", type="secondary"):
+            if st.session_state.get("confirm_delete") != True:
+                st.session_state.confirm_delete = True
+                st.warning("本当に削除しますか？ もう一度押すと削除されます。")
+            else:
+                with st.spinner("削除中..."):
+                    delete_file(file_id)
+                    st.session_state.current_file_id = None
+                    st.session_state.editor_content = ""
+                    st.session_state.confirm_delete = False
+                    st.success("削除しました")
+                    st.rerun()
